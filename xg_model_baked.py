@@ -1,13 +1,17 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
 
+# --- frozen MLS-trained xG model -------------------------------------------
 PENALTY_XG = 0.76
 GOAL_ARTIFACT_X = 50
 POSTS = (45.2, 54.8)
-FEATURE_COLS = ["dist", "angle", "head", "open_play", "assisted_throughball"]
+FEATURE_COLS = ['dist', 'angle', 'head', 'open_play', 'assisted_throughball']
+
+_COEF = np.array([-0.6424441787583652, 0.4791501045551712, -0.42190649386398515, 0.08967940645030949, 0.19115100916665412])
+_INTERCEPT = -2.4724226381668792
+_MEAN = np.array([16.811269915757205, 28.680392216327835, 0.16542859223654505, 0.6755152574466535, 0.02625446070934382])
+_SCALE = np.array([7.495108262090593, 19.11797348513632, 0.3715669160557489, 0.46818200991007225, 0.15989110044716476])
+# ---------------------------------------------------------------------------
 
 
 def _shot_angle(x, y):
@@ -43,46 +47,35 @@ def _is_penalty(df):
     return df[cols].fillna(False).astype(bool).any(axis=1)
 
 
-def add_xg(events, return_model=False):
-    """
-    Accepts a full Opta/WhoScored events DataFrame and returns it with an 'xG'
-    column. Non-shot rows get NaN, penalties get a flat value, and all other
-    shots get a model prediction. The model is trained on the non-penalty shots
-    within the input.
-    """
+def _predict(shots):
+    X = shots[FEATURE_COLS].to_numpy(dtype=float)
+    z = ((X - _MEAN) / _SCALE) @ _COEF + _INTERCEPT
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def add_xg(events):
+    """Applies the frozen MLS xG model. No training, no model file.
+    Returns events with xG, assist_playerId, and xG_assisted columns."""
     events = events.copy()
     events["xG"] = np.nan
 
     is_shot = events["type"].isin(["Goal", "SavedShot", "MissedShots", "ShotOnPost"])
     pens = _is_penalty(events)
-
     events.loc[is_shot & pens, "xG"] = PENALTY_XG
 
     artifact = (events["type"] == "Goal") & (events["x"] < GOAL_ARTIFACT_X)
-    model_mask = is_shot & ~pens & ~artifact
-    shots = _build_features(events.loc[model_mask], events)
-    shots["scored"] = (shots["type"] == "Goal").astype(int)
-    shots = shots.dropna(subset=["dist", "angle"])
+    mask = is_shot & ~pens & ~artifact
+    shots = _build_features(events.loc[mask], events).dropna(subset=["dist", "angle"])
 
-    model = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
-    model.fit(shots[FEATURE_COLS], shots["scored"])
+    if len(shots):
+        shots = shots.assign(xG=_predict(shots))
+        xg_by_id = shots.set_index("id")["xG"]
+        events["xG"] = events["xG"].fillna(events["id"].map(xg_by_id))
 
-    events.loc[shots.index, "xG"] = model.predict_proba(shots[FEATURE_COLS])[:, 1]
-
-    events = _add_xg_assisted(events)
-
-    if return_model:
-        return events, model
-    return events
+    return _add_xg_assisted(events)
 
 
 def _add_xg_assisted(events):
-    """
-    Credits each shot's xG to the player whose pass immediately preceded it.
-    Adds 'assist_playerId' (the passer) and 'xG_assisted' (= the shot's xG) on
-    shot rows that were preceded by a teammate's pass. Self-passes (dribble then
-    shot) and non-pass precursors get NaN.
-    """
     ev = events.sort_values(["matchId", "minute", "second", "id"]).copy()
     ev["prev_type"] = ev.groupby("matchId")["type"].shift(1)
     ev["prev_playerId"] = ev.groupby("matchId")["playerId"].shift(1)
@@ -92,22 +85,15 @@ def _add_xg_assisted(events):
 
     ev["assist_playerId"] = np.where(assisted, ev["prev_playerId"], np.nan)
     ev["xG_assisted"] = np.where(assisted, ev["xG"], np.nan)
-
     return ev.drop(columns=["prev_type", "prev_playerId"]).sort_index()
 
 
 def player_totals(events):
-    """
-    Aggregates per-player xG (as shooter) and xG assisted (as passer) from an
-    events frame already processed by add_xg. npxG strips penalty shots.
-    """
     pens = _is_penalty(events)
     shots = events[events["xG"].notna()]
-
     xg = shots.groupby("playerId")["xG"].sum().rename("xG")
     npxg = shots[~pens.reindex(shots.index, fill_value=False)] \
         .groupby("playerId")["xG"].sum().rename("npxG")
     xga = events.groupby("assist_playerId")["xG_assisted"].sum().rename("xG_assisted")
     xga.index.name = "playerId"
-
     return pd.concat([xg, npxg, xga], axis=1).fillna(0.0)
